@@ -1,0 +1,438 @@
+---
+title: "Forecasting Macroeconomic Variables"
+author: "Mantas Lašinis"
+date: "October 31, 2023"
+output:
+  rmdformats::downcute:
+    highlight: tango
+    code_folding: show
+    lightbox: true
+    gallery: true
+---
+
+```{r Setup, include=FALSE}
+  library(ggplot2)
+  library(readr)
+  library(tidyr)
+  library(dplyr)
+  library(stats)
+  library(forecast)
+  library(vars)
+  library(knitr)
+  library(kableExtra)
+  library(svars)
+```
+
+# Data processing and vizualization
+
+We are presented with `main_data.csv` file, which includes GDP growth rate, inflation and unemployment rate in Lithuania between 1998 and 2022.
+
+```{r Data processing and vizualization}
+  data <- read_csv("main_data.csv", show_col_types = FALSE)
+
+  data_long <- pivot_longer(
+    data, 
+    cols = c(gdp, inf, une), 
+    names_to = "Variable", 
+    values_to = "Value",
+    names_transform = list(Variable = ~ recode(.x, gdp = "GDP", inf = "Inflation", une = "Unemployment"))
+  )
+
+  ggplot(data_long, aes(x = period, y = Value, color = Variable)) +
+    geom_line() +
+    labs(title = "Historical Data of GDP Growth, Inflation, and Unemployment", x = "Date", y = "Value") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+```
+
+The dynamics of historical data seen in the plot suggest that the observed variables have certain relationships, most notably `GDP` and `Unemployment` will probably have an inverse relationship (e.g., when GDP falls in 2008, unemployment rises, while when GDP increases from approximately 2009 to 2010, the unemployment starts to decrease), which is consistent with Okun's Law from Economic Theory and substantiated by the GDP vs Unemployment scatterplot below.
+
+GDP and Inflation will most likely have a small relationship, given that the plots have both same and different trends at different time periods. When plotting a scatterplot GDP vs Inflation we can see a slight negative relationship between the two variables.
+
+Overall, given that both Unemployment and Inflation have some relation with GDP, it would be more appropriate to use a multivariate information set to produce forecasts.
+
+```{r Scatter plots for relationship modelling, fig.height=3, fig.show='hold', fig.width=4, message=FALSE, warning=FALSE}
+  # Scatter plot for GDP vs Unemployment
+  ggplot(data, aes(x = gdp, y = une)) +
+    geom_point(color = "blue") +
+    geom_smooth(method = "lm", color = "darkblue", se = FALSE) +
+    labs(title = "GDP vs Unemployment", x = "GDP Growth", y = "Unemployment") +
+    theme_minimal()
+  
+  # Scatter plot for GDP vs Inflation
+  ggplot(data, aes(x = gdp, y = inf)) +
+    geom_point(color = "red") +
+    geom_smooth(method = "lm", color = "darkred", se = FALSE) +
+    labs(title = "GDP vs Inflation", x = "GDP Growth", y = "Inflation") +
+    theme_minimal()
+
+```
+
+# Basic Forecast Modelling
+
+The code chunk below provides a comprehensive framework for estimating and forecasting GDP growth, inflation, and unemployment rate, using AR(1), MA(1), ARMA(1,1), and VAR(1) models. It defines the in-sample period (1998–2015) for model training and the holdout sample (2016–2022) for evaluating forecasts. The `get_models` function fits each model type, while `get_forecasts` generates one-step, two-step, and three-step forecasts. Forecast errors, including absolute and percentage errors, are calculated via `get_errors` by comparing forecasts to actual holdout data. Additionally, the `print_forecasts` function visualizes the in-sample data, forecasts, and actual holdout values for all variables and models.
+
+```{r Helper Functions}
+
+get_models <- function(data) {
+  return (
+    list(
+      AR1 = list(
+        gdp = Arima(data[, "gdp"], order = c(1, 0, 0)),
+        inf = Arima(data[, "inf"], order = c(1, 0, 0)),
+        une = Arima(data[, "une"], order = c(1, 0, 0))
+      ),
+      MA1 = list(
+        gdp = Arima(data[, "gdp"], order = c(0, 0, 1)),
+        inf = Arima(data[, "inf"], order = c(0, 0, 1)),
+        une = Arima(data[, "une"], order = c(0, 0, 1))
+      ),
+      ARMA1 = list(
+        gdp = Arima(data[, "gdp"], order = c(1, 0, 1)),
+        inf = Arima(data[, "inf"], order = c(1, 0, 1)),
+        une = Arima(data[, "une"], order = c(1, 0, 1))
+      ),
+      VAR1 = VAR(ts.union(data[, "gdp"], data[, "inf"], data[, "une"]), p = 1, type = "const")
+    )
+  )
+}
+get_forecasts <- function(models, steps = 3, start_year_forecast = 2016) {
+  forecasts <- list()
+  for (model in names(models)) {
+    if (model == "VAR1") next;
+    forecasts[[model]] <- lapply(models[[model]], function(variable) {
+      forecast_result <- forecast(variable, h = steps)
+      list(
+        forecast <- forecast_result,
+        mean = ts(forecast_result$mean, start = start_year_forecast, frequency = 1)
+      )
+    })
+  }
+  if ("VAR1" %in% names(models)) {
+    var_forecast <- forecast(models$VAR1, h = steps)
+    forecasts$VAR1 <- list(
+      gdp = list(
+        forecast = var_forecast$forecast$data....gdp..,
+        mean = var_forecast$forecast$data....gdp..$mean
+      ),
+      inf = list(
+        forecast = var_forecast$forecast$data....inf..,
+        mean = var_forecast$forecast$data....inf..$mean
+      ),
+      une = list(
+        forecast = var_forecast$forecast$data....une..,
+        mean = var_forecast$forecast$data....une..$mean
+      )
+    )
+  }
+  return(forecasts)
+}
+
+get_errors <- function(forecasts, holdout_data) {
+  errors <- list()
+  
+  for (model in names(forecasts)) {
+    errors[[model]] <- list()
+    for (variable in names(forecasts[[model]])) {
+      actual_values <- holdout_data[, variable]
+      forecast_mean <- forecasts[[model]][[variable]]$mean
+      if (length(forecast_mean) > length(actual_values)) {
+        warning(paste("Forecast length for", model, "exceeds actual values. Truncating forecast."))
+        forecast_mean <- forecast_mean[1:length(actual_values)]
+      } else if (length(forecast_mean) < length(actual_values)) {
+        actual_values <- actual_values[1:length(forecast_mean)]
+      }
+      errors[[model]][[variable]]$forecastError <-   actual_values - forecast_mean
+      errors[[model]][[variable]]$percentError <- (actual_values - forecast_mean ) / actual_values
+    }
+  }
+  return(errors)
+}
+
+print_forecasts <- function(forecasts, holdout_sample_data) {
+  for (model_group in names(forecasts)) {
+    cat("\n\n### Forecasts for Model Group:", model_group, "\n\n")
+    for (variable in names(forecasts[[model_group]])) {
+      forecast_data <- forecasts[[model_group]][[variable]][[1]]
+      holdout_series <- holdout_sample_data[, variable]
+      p <- autoplot(forecast_data) +
+        ggtitle(paste(model_group, "-", variable, "Forecast with Holdout Data")) +
+        theme_minimal() +
+        labs(y = "Value", x = "Time") +
+        geom_line(aes(x = time(holdout_series), y = as.numeric(holdout_series), color = "Holdout Data"), 
+                  linetype = "dashed") +
+        geom_line(aes(x = time(in_sample_data), y = as.numeric(in_sample_data[, variable]), color = "In Sample Data"), 
+                  linetype = "solid") +
+        theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom") +
+        scale_color_manual(values = c("Holdout Data" = "darkgreen", "In Sample Data" = "black"))
+      print(p)
+    }
+  }
+}
+
+data_ts <- ts(data, start = 1998, frequency = 1)
+
+in_sample_data <- window(data_ts, start = 1998, end = 2015, frequency = 1)
+holdout_sample_data <- window(data_ts, start = 2016, end = 2022, frequency = 1);
+
+models <- get_models(in_sample_data)
+
+forecasts_2016 <- get_forecasts(models, steps = 3, start_year_forecast = 2016)
+
+errors_2016 <- get_errors(forecasts_2016, holdout_sample_data)
+```
+
+By using helper functions we generate dataframes with the values needed for further analysis.
+
+``` {css, echo=FALSE}
+p:has(img:nth-child(3)) {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+p:has(img:nth-child(3)) img {
+  display: block;
+  width: calc((100% / 3) - 8px);
+  height: auto;
+}
+@media screen and (max-width: 767px) {
+p:has(img:nth-child(3)) img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+}
+```
+
+Below is presented forecasting data for 2016-2018. Black line represents in-sample data, green dashed line represents holdout data and blue plot represents forecast. Plots can be clicked to be expanded in HTML.
+
+```{r Plot Forecasts, results='asis'}
+
+print_forecasts(forecasts_2016, holdout_sample_data);
+
+```
+
+# Robustness analysis
+
+To see how our models perform, we redefine the in-sample and holdout data to obtain more forecast datapoints and more importantly model errors, so that we can more accurately determine the accuracy of each model used.
+
+```{r Redefining the sample}
+in_sample_data <- window(data_ts, start = 1999, end = 2016, frequency = 1)
+
+holdout_sample_data <- window(data_ts, start = 2017, end = 2021, frequency = 1);
+
+models <- get_models(in_sample_data)
+forecasts_2017 <- get_forecasts(models, steps = 3, start_year_forecast = 2017)
+
+errors_2017 <- get_errors(forecasts_2017, holdout_sample_data)
+```
+
+## Forecasts
+
+Forecasting data for 2017-2019 using in-sample as \(t = 1999, \dots, 2016 \). Black line represents in-sample data, green dashed line represents holdout data and blue plot represents forecast. Plots can be clicked to be expanded in HTML
+
+```{r Plot Forecasts 2017-2019, results='asis'}
+print_forecasts(forecasts_2017, holdout_sample_data)
+
+```
+
+Forecasting data for 2018-2020 using in-sample as \(t = 2000, \dots, 2017 \). Black line represents in-sample data, green dashed line represents holdout data and blue plot represents forecast. Plots can be clicked to be expanded in HTML
+```{r Plot Forecasts 2018-2020, results='asis'}
+
+in_sample_data <- window(data_ts, start = 2000, end = 2017, frequency = 1)
+holdout_sample_data <- window(data_ts, start = 2018, end = 2022, frequency = 1);
+
+models <- get_models(in_sample_data)
+
+forecasts_2018 <- get_forecasts(models, steps = 3, start_year_forecast = 2018)
+
+errors_2018 <- get_errors(forecasts_2018, holdout_sample_data)
+
+print_forecasts(forecasts_2018, holdout_sample_data)
+
+```
+
+# Accuracy Measures
+
+To determine accuracy of each model, we compute forecast errors.
+
+```{r Accuracy Measures}
+merge_all_errors <- function(error_list) {
+  merged_errors <- list()
+  for (model in c("AR1", "MA1", "ARMA1", "VAR1")) {
+    merged_errors[[model]] <- list()
+    for (variable in c("gdp", "inf", "une")) {
+      forecast_errors <- unlist(lapply(error_list, function(errors) errors[[model]][[variable]]$forecastError))
+      percent_errors <- unlist(lapply(error_list, function(errors) errors[[model]][[variable]]$percentError))
+      merged_errors[[model]][[variable]] <- list(
+        forecastError = forecast_errors,
+        percentError = percent_errors
+      )
+    }
+  }
+  
+  return(merged_errors)
+}
+
+all_errors <- merge_all_errors(list(errors_2016, errors_2017, errors_2018))
+
+compute_metrics <- function(forecast_errors, percent_errors) {
+  mse <- mean(forecast_errors^2)
+  mspe <- mean((percent_errors)^2)
+  rmse <- sqrt(mse)
+  rmspe <- sqrt(mspe)
+  mae <- mean(abs(forecast_errors))
+  mape <- mean(abs(percent_errors))
+  
+  return(c(MSE = mse, MSPE = mspe, RMSE = rmse, RMSPE = rmspe, MAE = mae, MAPE = mape))
+}
+
+results_list <- list()
+
+for (variable in names(all_errors[[1]])) {
+  for (model in names(all_errors)) {
+    forecast_errors <- all_errors[[model]][[variable]]$forecastError
+    percent_errors <- all_errors[[model]][[variable]]$percentError
+    
+    results_list[[paste(variable, "-", model)]] <- compute_metrics(forecast_errors, percent_errors)
+  }
+}
+
+results_df <- do.call(rbind, results_list)
+results_df <- as.data.frame(results_df, row.names = names(results_list))
+
+results_df %>%
+  kable("html", caption = "Forecast Error Metrics for Each Model and Variable") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+```
+
+The major conflicts between models in this case occur when percentage metrics (MSPE, RMSPE, MAPE) are smaller in one models, while absolute metrics (MSE, RMSE, MAE) are higher. Since the original data comes from the growth of variables `GDP`, `Inflation` and `Unemployment`, and growth rates are a comparatively small value variable and not deviating that widely over time, percentage metrics are not as good measure in comparing the models in this case, since they might be downplaying large deviations when original values are small. Given this reason, we can investigate which models have performed best for each of the investigated variables.
+
+`GDP`: Best model to estimate gdp growth, given the error metrics provided in the table above  is MA(1). It outperforms all other models in the absolute metrics (MSE, RMSE, MAE) and therefore is the best choice here to estimate GDP growth.
+
+`Inflation`: Best model to estimate inflation growth seems to be also be MA(1). It's metrics completely outperforms AR(1) and VAR(1) and are quite close to ARMA(1), but given that absolute metrics (MSE, RMSE, MAE) are better overall in MA(1), this model would be the best choice to estimate inflation growth rates.
+
+`Unemployment`: Best model to estimate unemployment rate is VAR(1). It's error metrics completely outperform other models.
+
+# Determining best models for each variable
+
+Because original data has large fluctuations, and RMSE is generally known to handle them well, we will utilize this error metric to choose 2 best models for each of the variables. To substantiate our findings, and see if one of the models outperform the other, we'll also perform Diebold-Mariano test.
+
+```{r Best Models using RMSE}
+choose_best_models <- function(results_df, metric = "RMSE") {
+  variables <- unique(sub(" - .*", "", rownames(results_df)))
+  best_models <- list()
+  for (variable in variables) {
+    variable_rows <- grep(paste0("^", variable, " - "), rownames(results_df), value = TRUE)
+    variable_df <- results_df[variable_rows, , drop = FALSE]
+    ordered_variable_df <- variable_df[order(variable_df[[metric]]), ]
+    top_two_models <- sub(".* - ", "", rownames(ordered_variable_df)[1:2])
+    best_models[[variable]] <- top_two_models
+  }
+  
+  return(best_models)
+}
+best_models <- choose_best_models(results_df, metric = "RMSE")
+
+```
+
+```{r Diebold-Mariano Test}
+dm_results <- list()
+
+for (variable in names(best_models)) {
+  model1 <- best_models[[variable]][1]
+  model2 <- best_models[[variable]][2]
+  
+  errors_model1 <- all_errors[[model1]][[variable]]$forecastError
+  errors_model2 <- all_errors[[model2]][[variable]]$forecastError
+  
+  dm_test_result <- dm.test(errors_model1, errors_model2, alternative = "two.sided", h = 1, power = 2)
+  
+  dm_results[[variable]] <- list(
+    model1 = model1,
+    model2 = model2,
+    p_value = dm_test_result$p.value,
+    DM_statistic = dm_test_result$statistic
+  )
+}
+
+
+dm_df <- do.call(rbind, lapply(names(dm_results), function(variable) {
+  cbind(
+    Variable = variable,
+    model1 = dm_results[[variable]]$model1,
+    model2 = dm_results[[variable]]$model2,
+    p_value = dm_results[[variable]]$p_value
+  )
+}))
+
+dm_df <- as.data.frame(dm_df, stringsAsFactors = FALSE)
+colnames(dm_df) <- c("Variable", "Best Model", "Second Best Model", "p-value")
+
+dm_df %>%
+  kable("html", caption = "Diebold-Mariano Test Results for Forecasting Models", row.names = FALSE) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+```
+
+As we can see from the table above, the difference between  MA(1) and AR(1) in GDP forecasting is statistically significant at 95% confidence level, while differences for Inflation and Unemployment are not. While we could treat differences in Unemployment as statistically significant at 90%, differences in Inflation are still not. It is consistent with the insights from previous analysis, where in metrics breakdown table ARMA(1) was quite close in performance with MA(1), and given the results from Diebold-Mariano test, for Inflation we could probably use either or both models for forecasting Inflation.
+
+
+# Enhancing inflation forecast for 2023
+
+To enhance `Inflation` forecast for 2023, the model is extended as follows:
+
+1. Data used previously from the `main_data` will be extended with the following variables, that are theoretically related with inflation:
+    + `Interest Rate` (or `int`) - Loans granted by MFIs to euro area non-financial corporations and households - interest rates on new business (Annual) from [Bank of Lithuania](https://www.lb.lt/en/mfi-interest-rate-statistics-1?ff=1&date_interval%5Bfrom%5D=2015-01&PNS_DUOM_TIPAS%5B%5D=C). The economic reasoning for including this variable comes from the theory, that higher interest rates tend to reduce spending and borrowing, which can lower inflation, while lower interest rates generally result in spending, which can increase inflation.
+    + `Money Supply Growth Rates` (or `mos`) - M3 Total (Annual) calculated as growth rates starting from 2016 from [Bank of Lithuania](https://www.lb.lt/en/contribution-of-lithuania-to-monetary-aggregates-and-counterparts?ff=1&date_interval%5Bfrom%5D=2015-01&DUOM_TIPAS=1). Money supply, growing faster than economic output can increase inflation, therefore, from economical perspective, it is reasonable to include it in the model.
+    + `Crude Oil Prices` (or `oil`) - Average Closing Price (Annual) of Crude Oil Prices from [Macrotrends](https://www.macrotrends.net/1369/crude-oil-price-history-chart#google_vignette). Since oil prices are key component of production costs, especially in energy-dependent industries, changes in oil prices directly affect the cost of goods and services, which theoretically lead to fluctuations in inflation.
+    + `Euro Dollar Exchange Rate` (or `exr`) - Average Closing Price (Annual) of Euro Dollar Exchange Rate from [Macrotrends](https://www.macrotrends.net/2548/euro-dollar-exchange-rate-historical-chart). Because exchange rates directly affects trade, decrease in euro compared to a dollar makes imports more expensive, contributing to higher inflation.
+2. Since Data from the Bank of Lithuania is only available from 2015, and growth rates for Money Supply are measured from 2016, the sample range is from 2016 to 2022.
+3. Inflation will be regressed on all variables separately in a linear regression model to understand, which of the variables have statistically significant relationships with inflation at 90% confidence level.
+4. Statistically significant variables will be merged with inflation in a Vector autoregression model of order 1 and forecasts will be obtained.
+
+
+```{r Enhancing inflation forecast for 2023}
+data <- read_csv("additional_data.csv", show_col_types = FALSE)
+
+find_significant_variables_90 <- function(data) {
+  
+  results <- data.frame(Variable = character(), Coefficient = numeric(), P_Value = numeric(), stringsAsFactors = FALSE)
+  
+  predictors <- setdiff(names(data), "inf")
+  
+  for (predictor in predictors) {
+    formula <- as.formula(paste("inf ~", predictor))
+    
+    model <- lm(formula, data = data)
+    
+    coefficient <- summary(model)$coefficients[2, 1] 
+    p_value <- summary(model)$coefficients[2, 4]
+    
+    results <- results %>% add_row(Variable = predictor, Coefficient = coefficient, P_Value = p_value)
+  }
+  
+  significant_vars <- results %>% filter(P_Value < 0.10)
+  
+  return(significant_vars$Variable)
+}
+
+significant_variables <- find_significant_variables_90(data)
+print(significant_variables)
+```
+
+After investigating relationships between inflation and other variables, we get that at 90% confidence level, statistically significant relationships are between `Inflation` and `Interest Rate`, `Crude Oil Prices` and `Euro Dollar Exchange Rate`. These variables will be used in the VAR(1) model to predict Inflation in 2023.
+
+```{r Enhancing inflation forecast for 2023 continued}
+data_ts <- ts(data, start = 2016, frequency = 1)
+
+var_model <- VAR(data_ts[,c("inf", significant_variables)], p = 1, type="const")
+var_forecast <- forecast(var_model, h = 1)
+
+inflation_forecast_2023 <- var_forecast$forecast$inf$mean
+
+print(paste("VAR Model Forecast for Inflation in 2023:", inflation_forecast_2023))
+```
+
+Inflation in 2023 is predicted to be approximately 9.55.
